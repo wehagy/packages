@@ -5,14 +5,82 @@ STOP=10
 
 USE_PROCD=1
 
+PROG="/usr/bin/netbird"
+
+validate_global_section() {
+	uci_validate_section netbird "${1}" "${2}" \
+		'nb_disable_ssh_config:regex("^(0|1|true|false)$"):1' \
+		'nb_dns_state_file:regex("^/[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)*\.json$"):/var/lib/netbird/state.json' \
+		'nb_state_dir:regex("^/[a-zA-Z0-9_.-]+(/[a-zA-Z0-9_.-]+)*/?$"):/root/.config/netbird'
+}
+
+load_profile_section() {
+	uci_load_validate netbird "${1}" "${2}" "${3}" \
+		'nb_enable_ssh_root:regex("^(0|1|true|false)$"):1' \
+		'nb_enable_ssh_sftp:regex("^(0|1|true|false)$"):0' \
+		'nb_no_browser:regex("^(0|1|true|false)$"):1'
+}
+
+wait_daemon() {                                            
+	local message="${1}"
+	local line
+	local timeout=15
+	local i=0
+
+	while read -t 5 -r line; do
+		case "${line}" in
+			*"${message}"*)
+				return
+				;;
+		esac
+
+		i=$((i + 1))
+		if [ "${i}" -ge "${timeout}" ]; then
+			return 1
+		fi
+	done < <(tail -n0 -F "/var/log/netbird/client.log")
+}                                                                           
+
+
 start_service() {
+	validate_global_section global main || {
+		logger -s -p err -t netbird "Check global config section"
+		exit 1
+	}
+
 	procd_open_instance
-	procd_set_param command /usr/bin/netbird
+	procd_set_param command "${PROG}"
 	procd_append_param command service run
 
-	procd_set_param env NB_STATE_DIR="/root/.config/netbird"
-	procd_append_param env NB_DISABLE_SSH_CONFIG="1"
-	procd_append_param env NB_DNS_STATE_FILE="/var/lib/netbird/state.json"
+	procd_set_param env NB_DISABLE_SSH_CONFIG="${nb_disable_ssh_config}"
+	procd_append_param env NB_DNS_STATE_FILE="${nb_dns_state_file}"
+	procd_append_param env NB_STATE_DIR="${nb_state_dir}"
 
 	procd_close_instance
+}
+
+service_started() {
+	reload_service
+}
+
+reload_service() {
+	load_profile_section profile default updown || {
+		/etc/init.d/netbird stop
+		logger -s -p err -t netbird "Check profile config section"
+		exit 1
+	}
+}
+
+updown() {
+	if wait_daemon "started daemon server"; then
+		"${PROG}" down
+		wait_daemon "service is down"
+		NB_ENABLE_SSH_ROOT="${nb_enable_ssh_root}" \
+		NB_ENABLE_SSH_SFTP="${nb_enable_ssh_sftp}" \
+		NB_NO_BROWSER="${nb_no_browser}" \
+		"${PROG}" up
+	else
+		logger -s -p err -t netbird "No daemon found"
+		exit 1
+	fi
 }
