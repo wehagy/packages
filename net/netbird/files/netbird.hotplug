@@ -1,0 +1,20 @@
+#!/bin/sh
+
+# Reload firewall rules when a netbird interface goes up or down
+# This file must be placed at /etc/hotplug.d/iface/50-netbird 
+case "${ACTION}" in
+	"ifup"|"ifdown")
+		# Read the protocol used by this network interface.
+		PROTOCOL="$(ubus call network.interface."${INTERFACE}" status | jsonfilter -e '@.proto')"
+
+		# If this interface uses the netbird protocol, reload firewall
+		[ "${PROTOCOL}" = "netbird" ] && {
+			DATA_FIREWALL="$(ubus call network.interface."${INTERFACE}" status | jsonfilter -e '@.data.firewall')"
+			[ -n "${DATA_FIREWALL}" ] || exit 0
+
+			logger -t firewall "Reloading firewall due to ${ACTION} of ${INTERFACE} (${DEVICE})"
+			fw4 -q reload
+		}
+	;;
+esac
+

@@ -1,0 +1,11 @@
+{  
+    "luci-proto-netbird": {  
+        "description": "Grant access to NetBird status and login",  
+        "read": {  
+            "ubus": {  
+                "luci.netbird": [ "getStatus", "getLoginInfo" ]  
+            }  
+        }  
+    }  
+}
+

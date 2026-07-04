@@ -1,0 +1,55 @@
+'use strict';  
+  
+import { popen } from 'fs';  
+  
+const methods = {  
+    getStatus: {  
+        call: function() {  
+            let fd = popen('timeout 5 netbird status --json 2>/dev/null');  
+            if (!fd) return { error: 'Failed to run netbird' };  
+            let output = fd.read('all');  
+            fd.close();  
+            try { return { result: json(output) }; }  
+            catch(e) { return { error: 'Invalid JSON' }; }  
+        }  
+    },  
+  
+    getLoginInfo: {  
+        call: function() {  
+            // Verifica o status primeiro para evitar executar 'netbird up'  
+            // desnecessariamente quando o daemon já está conectado.  
+            let statusFd = popen('timeout 5 netbird status --json 2>/dev/null');  
+            if (!statusFd) return { needsLogin: false, error: 'Cannot get status' };  
+  
+            let statusOutput = statusFd.read('all');  
+            statusFd.close();  
+  
+            let status;  
+            try { status = json(statusOutput); }  
+            catch(e) { return { needsLogin: false, error: 'Invalid status JSON' }; }  
+  
+            let daemonStatus = status.daemonStatus || '';  
+  
+            // Ajuste 'NeedsLogin' se o seu daemon usar outro valor.  
+            // Verifique com: netbird status --json | jsonfilter -e '@.daemonStatus'  
+            if (daemonStatus !== 'NeedsLogin')  
+                return { needsLogin: false, daemonStatus: daemonStatus };  
+  
+            // O comando 'netbird up --qr --no-browser' imprime a URL e o QR code  
+            // nos primeiros segundos e depois aguarda o login indefinidamente.  
+            // O 'timeout 8' encerra o processo após 8s, capturando a saída inicial.  
+            // Isso bloqueia o event loop do rpcd por até 8s — aceitável aqui porque  
+            // só é chamado quando o daemon explicitamente precisa de login.  
+            let loginFd = popen('timeout 8 netbird up --qr --no-browser 2>&1 | grep "http"');  
+            if (!loginFd) return { needsLogin: true, daemonStatus: daemonStatus, error: 'Cannot run netbird up' };  
+  
+            let loginOutput = loginFd.read('all');  
+            loginFd.close();  
+  
+            return { needsLogin: true, daemonStatus: daemonStatus, output: loginOutput };  
+        }  
+    }  
+};  
+  
+return { 'luci.netbird': methods };
+

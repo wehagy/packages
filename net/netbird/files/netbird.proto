@@ -1,0 +1,255 @@
+#!/bin/sh
+#
+# vim: set filetype=sh :
+# shellcheck disable=1091,2034,3043
+#
+# netbird protocol handler for OpenWrt/netifd
+# This file must be placed at /lib/netifd/proto/netbird.sh
+#
+# This script manages the netbird daemon lifecycle through netifd proto_run_command
+# and proto_kill_command hooks, similar to the autoip and zerotier protocols
+# This approach ensures that network restarts properly tear down and restore the VPN tunnel,
+#
+# FIX:
+# - After connecting to a netnird tunnel, verify netbird connectivity
+#   with `ping <netbird client ip>`, it should work
+# - Restart the network service with `service network restart`
+# - Check `ping <netBird client ip>` again, it will no longer work
+#
+# Key design decisions:
+# - netbird manages routing via custom routing table + policy rules on the wt0 device
+#   I do NOT set PROTO_ROUTE to avoid netifd interfering with netbird L3 configuration
+# - Interface addresses are reported as EXTERNAL (via proto_init_update) so they appear
+#   in ifstatus/LuCI output but are not managed by netifd
+#
+# Daemon startup environment variables:
+#   NB_STATE_DIR="/root/.config/netbird"
+#   NB_DISABLE_SSH_CONFIG="1"
+#   NB_DNS_STATE_FILE="/var/lib/netbird/state.json"
+#
+# IMPORTANT: Disable the init-script service to prevent duplicate daemon instances:
+#   /etc/init.d/netbird disable && /etc/init.d/netbird stop
+#
+# Example UCI configuration:
+#	config interface 'netbird0'
+#		option proto		'netbird'
+#		option device		'wt0'			# Tunnel device created by netbird
+#		option searchdomain	'netbird.cloud'		# netbird internal domain
+#		option state_dir	'/root/.config/netbird'	# netbird state directory
+#		option delay		'25'			# Startup timeout in seconds
+
+PROG=/usr/bin/netbird
+
+[ -n "$INCLUDE_ONLY" ] || {
+	. /lib/functions.sh
+	. ../netifd-proto.sh
+	init_proto "$@"
+}
+
+get_value() {
+	jsonfilter -s "${DAEMON_STATUS}" -e "@.${1}"
+}
+
+# TODO: add more common options and tweak the defaults
+proto_netbird_init_config() {
+	available=1
+	no_device=1
+
+	# Managed by the protocol
+	proto_config_add_int		'delay'
+	proto_config_add_string		'device'
+	proto_config_add_string		'searchdomain'
+
+	# Applied when starting netbird
+	proto_config_add_string		'state_dir'
+	proto_config_add_boolean	'disable_ssh_config'
+	proto_config_add_string		'dns_state_file'
+
+	# Applied only for netbird down/up
+	proto_config_add_boolean	'enable_ssh_root'
+}
+
+proto_netbird_setup() {
+	local interface="${1}"
+
+	# Managed by the protocol
+	local delay device searchdomain
+	json_get_vars \
+		delay:25 \
+		device:wt0 \
+		searchdomain:netbird.cloud
+
+	# Applied when starting netbird
+	local state_dir disable_ssh_config dns_state_file
+	json_get_vars \
+		state_dir:/root/.config/netbird \
+		disable_ssh_config:1 \
+		dns_state_file:/var/lib/netbird/state.json
+
+	# Applied only for netbird down/up
+	local enable_ssh_root
+	json_get_vars enable_ssh_root
+
+	# TODO: Integrategrate with dnsmasq
+	# leak netbird.io domain (management url) to some public dns for initial connection
+#	mkdir -p /tmp/dnsmasq.d/
+#	cat > /tmp/dnsmasq.cfg01411c.d/netbird.conf <<- EOF
+#		server=/netbird.io/8.8.8.8
+#	EOF
+#	service dnsmasq restart
+
+	# Launch the netbird daemon in foreground mode under netifd supervision
+	# netifd handles process lifecycle: restarts on 'network restart', stops on 'ifdown'
+	proto_export "NB_STATE_DIR=${state_dir}"
+	proto_export "NB_DISABLE_SSH_CONFIG=${disable_ssh_config}"
+	proto_export "NB_DNS_STATE_FILE=${dns_state_file}"
+	proto_run_command "${interface}" "${PROG}" service run
+
+	# Check if netbird has connected to the management server
+	# TODO: add login support and make the down/up sequence less ugly
+#	local waited=0
+#	sleep 5
+#	while [ "${waited}" -lt "${delay}" ]; do
+#		if "${PROG}" status --check startup; then
+#			"${PROG}" down && \
+#				NB_ENABLE_SSH_ROOT="${enable_ssh_root}" \
+#			"${PROG}" up
+#			break
+#		fi
+#		sleep 5
+#		waited=$((waited + 5))
+#	done
+
+	local waited=0
+	while true; do
+		sleep 5
+		#DAEMON_STATUS="$(${PROG} status --json | jsonfilter -e '@.daemonStatus')"
+		DAEMON_STATUS="$(${PROG} status --json)"
+
+		case "$(get_value 'daemonStatus')" in
+			"Connecting")
+				echo "Status: Conectando... aguardando"
+			;;
+			"NeedsLogin"|"LoginFailed"|"SessionExpired")
+				echo "Status: Necessita autenticação"
+				proto_notify_error "${interface}" "LOGIN_FAILED OH NOOOO"
+				proto_block_restart "${interface}"
+				proto_setup_failed "${interface}"
+				return 1
+			;;
+			"Connected")
+				echo "Status: Conectado"
+				break
+			;;
+			*)
+				echo "Status: ${DAEMON_STATUS} (outro estado)"
+				proto_notify_error "${interface}" NO_DEVICE
+				return 1
+			;;
+		esac
+
+		waited=$((waited + 5))
+		# Timeout após 30 segundos
+		[ "${waited}" -ge 30 ] && {
+			echo "Timeout: Serviço não respondeu após 30 segundos"
+			proto_notify_error "$cfg" NO_DEVICE
+			proto_block_restart "${interface}"
+			proto_setup_failed "${interface}"
+			return 1
+		}
+
+	done
+
+	# Verify the tunnel device exists, fail gracefully if startup timeout exceeded
+#	[ -L "/sys/class/net/${device}" ] || {
+#		echo "netbird: tunnel device ${device} did not appear within ${delay}s"
+#		proto_notify_error "$cfg" NO_DEVICE
+#		return 1
+#	}
+
+	# Retrieve IPv4 and IPv6 addresses assigned by netbird.
+#	local ipv4 ipv6
+#	json_init
+#		json_load "$(${PROG} status --json)"
+#		json_get_var ipv4 netbirdIp
+#		json_get_var ipv6 netbirdIp6
+#	json_cleanup
+
+	# Report addresses to netifd with EXTERNAL flag (3rd arg = 1)
+	# This makes addresses visible in ifstatus/LuCI but prevents netifd from managing them
+	# Omit PROTO_ROUTE to preserve netbird custom routing table and policy rules
+	proto_init_update "${device}" 1 1
+
+	# Parse addresses from 'ip/prefix' format and register them with netifd
+	local ipv4="$(get_value 'netbirdIp')"
+	local ipv6="$(get_value 'netbirdIpv6')"
+	proto_add_ipv4_address "${ipv4%%/*}" "${ipv4##*/}"
+	proto_add_ipv6_address "${ipv6%%/*}" "${ipv6##*/}"
+
+	# TODO: add an option to change the DNS server and integrate with netbird down/up
+	proto_add_dns_search "${searchdomain}"
+	proto_add_dns_server "127.0.0.153"
+
+	# Configure firewall rules to permit traffic between netbird and LAN/WAN zones
+	# Firewall reload is handled by the hotplug /etc/hotplug.d/iface/50-netbird
+	# Detects if the user assignet any zone or device to zone and noop
+	# TODO: log if not setting custom rules and log if adding custom rules
+	fw4 -q network "${interface}" || fw4 -q device "${device}" || {
+		proto_add_data
+			json_add_array firewall
+				# Allow outbound traffic from LAN to netbird tunnel
+				json_add_object ""
+					json_add_string type		'rule'
+					json_add_string src		'lan'
+					json_add_string dest		'*'
+					json_add_string device		"${device}"
+					json_add_string direction	'out'
+					json_add_string target		'ACCEPT'
+				json_close_object
+
+				# Allow inbound traffic from netbird tunnel to LAN
+				json_add_object ""
+					json_add_string type		'rule'
+					json_add_string src		'*'
+					json_add_string dest		'lan'
+					json_add_string device		"${device}"
+					json_add_string direction	'in'
+					json_add_string target		'ACCEPT'
+				json_close_object
+
+				# Allow inbound traffic from netbird to WAN (exit node)
+				json_add_object ""
+					json_add_string type		'rule'
+					json_add_string src		'*'
+					json_add_string dest		'wan'
+					json_add_string device		"${device}"
+					json_add_string direction	'in'
+					json_add_string target		'ACCEPT'
+				json_close_object
+			json_close_array
+		proto_close_data
+	}
+
+	echo "netbird: ${device} is up (routes managed by netbird)"
+
+	# Notify netifd of the updated interface state
+	proto_send_update "${interface}"
+}
+
+proto_netbird_teardown() {
+	local interface="${1}"
+
+	# TODO: Integrategrate with dnsmasq
+	# leak netbird.io (management url) to some public dns for initial connection
+#	rm -rf /tmp/dnsmasq.cfg01411c.d/netbird.conf
+#	service dnsmasq restart
+
+	# netifd terminates the supervised daemon process
+	# On network restart, setup runs again and netbird cleanly reestablishes the tunnel
+	proto_kill_command "${interface}"
+}
+
+[ -n "$INCLUDE_ONLY" ] || {
+	add_protocol netbird
+}
+
